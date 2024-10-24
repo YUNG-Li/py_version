@@ -1,0 +1,233 @@
+import os
+import cv2
+import numpy as np
+import time
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
+from scipy.ndimage import generic_filter
+# 设置输入图像文件夹路径
+input_folder = r'D:\dolphin_dataset\handled\oringin\detect-train-2-2\images'
+ext = ['.jpg', '.png', '.bmp']  # 支持的图像文件扩展名
+images = []  # 初始化图像列表
+
+# 创建变量以存储上一个图像的尺寸
+prev_height = -1
+prev_width = -1
+
+# 遍历每种扩展名，找到输入文件夹中的所有图像
+for extension in ext:
+    images.extend([f for f in os.listdir(input_folder) if f.endswith(extension)])
+
+# 遍历所有图像
+overall_start_time = time.time()
+for i, image_name in enumerate(images):
+    single_time = time.time()
+    current_frame_start_time = time.time()
+
+    # 读取当前图像
+    image_path = os.path.join(input_folder, image_name)
+    I = cv2.imread(image_path)
+    elapsed_time_read = time.time() - current_frame_start_time
+    print(f'读图经过的时间: {elapsed_time_read:.4f} 秒')
+
+    # 获取当前图像的尺寸
+    height, width = I.shape[:2]
+
+
+    # 计算标准差滤波
+    def std_filter(window):
+        return np.std(window)
+
+
+    Zs = generic_filter(I, std_filter, size=(3, 3, 1))  # 3x3 窗口，适用于彩色图像
+
+    # 将图像转换为 double 类型以便后续处理
+    Z = np.double(I)
+
+    # 元素逐次相乘，增强强度变化
+    Zs = Zs * Z
+
+    # 使用梯度阈值粗略地选取候选点
+    rate = 0.5  # 梯度阈值
+    max_rate = 0.9  # 原来为0.9  城市设置为0.5
+    mean_std = np.mean(Zs)  # 过滤后的图像的均值
+    max_std = np.max(Zs)  # 过滤后图像的最大强度
+
+    # 找到强度大于阈值的候选点
+    points_candi = np.argwhere(Zs > rate * max_std)  # 获取候选点的坐标
+    points_candi = points_candi[:, [0, 1]]  # 选择行和列
+
+    # DBSCAN 聚类参数设置
+    epsilon = 10  # 邻域半径
+    MinPts = 1  # 形成簇的最小点数
+    DBSCANtic = time.time()
+
+    # DBSCAN 聚类
+    dbscan = DBSCAN(eps=epsilon, min_samples=MinPts)
+    IDX_candi = dbscan.fit_predict(points_candi)
+    elapsedTime3 = time.time() - DBSCANtic  # 记录处理当前帧所用的时间
+    print(f'DBSCAN处理时间为: {elapsedTime3:.4f} 秒')
+
+    k_candi = len(set(IDX_candi)) - (1 if -1 in IDX_candi else 0)  # 聚类数量
+
+    # 初始化每个聚类的平均位置
+    mean_points_candi = np.zeros((k_candi, 2))
+    retina_pixel_FOV = 0.1  # 每像素的视场角（单位：毫弧度）
+    small_rect = (1.2 / retina_pixel_FOV / 2)  # 小物体的矩形框大小
+    large_rect = round(3 / retina_pixel_FOV / 2)  # 大物体的矩形框大小
+
+    cumulative_points = []  # 用于进一步分析的累积点
+    min_width_large = np.zeros(k_candi)  # 初始化最小行边界
+    max_width_large = np.zeros(k_candi)  # 初始化最大行边界
+    min_heigh_large = np.zeros(k_candi)  # 初始化最小列边界
+    max_heigh_large = np.zeros(k_candi)  # 初始化最大列边界
+
+    # 初始化空列表
+    col = []
+    row = []
+
+    # 遍历每个聚类
+    for j in range(k_candi):
+        # 计算聚类的平均位置
+        if points_candi[IDX_candi == j].shape[0] == 1:
+            mean_points_candi[j, :] = points_candi[IDX_candi == j]
+        else:
+            mean_points_candi[j, :] = np.mean(points_candi[IDX_candi == j], axis=0)
+
+        # 定义聚类的矩形边界
+        min_width_large = round(np.min(mean_points_candi[j, 0])) - large_rect  # 行
+        max_width_large = round(np.max(mean_points_candi[j, 0])) + large_rect
+        min_heigh_large = round(np.min(mean_points_candi[j, 1])) - large_rect  # 列
+        max_heigh_large = round(np.max(mean_points_candi[j, 1])) + large_rect
+
+        # 确保边界在图像范围内
+        min_width_large = max(min_width_large, 1)
+        max_width_large = min(max_width_large, width)
+        min_heigh_large = max(min_heigh_large, 1)
+        max_heigh_large = min(max_heigh_large, height)
+
+        # 创建候选区域的掩膜
+        mask_candi = np.zeros((height, width))
+        mask_candi[min_heigh_large:max_heigh_large, min_width_large:max_width_large] = 1
+        # 将 Z 转换为灰度图像
+        Z_gray = cv2.cvtColor(I, cv2.COLOR_BGR2GRAY)
+        # 计算候选区域的平均和最大强度
+        meanz = np.mean(mask_candi * Z_gray)
+        maxz = np.max(mask_candi * Z_gray)
+
+        # 找到强度高于平均值的像素
+        rows, cols = np.where(mask_candi * Z_gray > meanz + max_rate * (maxz - meanz))
+
+        col.append(cols)  # 存储列索引
+        row.append(rows)  # 存储行索引
+
+        points_j = np.column_stack((rows, cols))  # 存储聚类的像素点
+        cumulative_points.append(points_j)  # 累积点用于进一步分析
+    # 将 cumulative_points 从列表转换为 NumPy 数组
+    cumulative_points = np.vstack(cumulative_points)  # 将列表中的数组垂直堆叠成一个二维数组
+
+    # 现在可以进行 DBSCAN 聚类
+    cum_IDX = DBSCAN(eps=epsilon / 2, min_samples=MinPts * 2).fit_predict(cumulative_points)
+    k_obj = np.max(cum_IDX) + 1  # 找到对象的数量，DBSCAN 返回的类标签从 -1 开始
+
+    new_points = np.zeros((k_obj, 2))  # 初始化新聚类中心
+    new_points_min = np.zeros((k_obj, 2))  # 初始化最小边界
+    new_points_max = np.zeros((k_obj, 2))  # 初始化最大边界
+
+    # 如果没有找到聚类，则将所有累积点视为一个新点
+    if k_obj == 1 and np.all(cum_IDX == -1):  # 只有一类，且都是噪声点
+        new_points = cumulative_points
+        k_obj = new_points.shape[0]
+    else:
+        # 遍历每个聚类
+        for j in range(k_obj):
+            # 如果对象存在，则计算聚类的平均位置
+            if np.any(cum_IDX == j):
+                new_points[j, :] = np.mean(cumulative_points[cum_IDX == j], axis=0)  # 计算平均位置
+                new_points_min[j, 0] = np.min(cumulative_points[cum_IDX == j, 0])  # 获取最小X坐标
+                new_points_min[j, 1] = np.min(cumulative_points[cum_IDX == j, 1])  # 获取最小Y坐标
+                new_points_max[j, 0] = np.max(cumulative_points[cum_IDX == j, 0])  # 获取最大X坐标
+                new_points_max[j, 1] = np.max(cumulative_points[cum_IDX == j, 1])  # 获取最大Y坐标
+            else:
+                # 如果没有找到聚类，取累积点的最小和最大值
+                new_points_min[j, 0] = np.min(new_points[:, 0])
+                new_points_min[j, 1] = np.min(new_points[:, 1])
+                new_points_max[j, 0] = np.max(new_points[:, 0])
+                new_points_max[j, 1] = np.max(new_points[:, 1])
+
+    # 定义 cumulative_points 为列表
+    cumulative_points = []  # 用于进一步分析的累积点
+
+    # 遍历每个聚类
+    for j in range(k_candi):
+        cluster_points = points_candi[IDX_candi == j]
+        cumulative_points.append(cluster_points)  # 使用 append 而不是 extend
+
+    # 将 cumulative_points 从列表转换为 NumPy 数组
+    cumulative_points = np.vstack(cumulative_points)  # 将列表中的数组垂直堆叠成一个二维数组
+
+    # 更严格的 DBSCAN 聚类
+    cum_IDX = DBSCAN(eps=epsilon / 2, min_samples=MinPts * 2).fit_predict(cumulative_points)
+    k_obj = len(set(cum_IDX)) - (1 if -1 in cum_IDX else 0)
+
+    # 初始化新聚类中心
+    new_points = np.zeros((k_obj, 2))  # 根据聚类的数量初始化
+
+    # 如果没有找到聚类，则将所有累积点视为一个新点
+    if k_obj == 0:
+        new_points = cumulative_points
+        k_obj = new_points.shape[0]
+
+    # 遍历每个聚类
+    new_points_min = np.zeros((k_obj, 2))
+    new_points_max = np.zeros((k_obj, 2))
+
+    for j in range(k_obj):
+        # 如果对象存在，则计算聚类的平均位置
+        if cum_IDX[j] != 0 or np.max(cum_IDX) != 0:
+            new_points[j, :] = np.mean(cumulative_points[cum_IDX == j], axis=0)  # 计算平均位置
+            new_points_min[j, 0] = np.min(cumulative_points[cum_IDX == j, 0])  # 获取最小X坐标
+            new_points_min[j, 1] = np.min(cumulative_points[cum_IDX == j, 1])  # 获取最小Y坐标
+            new_points_max[j, 0] = np.max(cumulative_points[cum_IDX == j, 0])  # 获取最大X坐标
+            new_points_max[j, 1] = np.max(cumulative_points[cum_IDX == j, 1])  # 获取最大Y坐标
+        else:
+            # 如果没有找到聚类，取累积点的最小和最大
+            new_points_min[j, 0] = np.min(new_points[:, 0])
+            new_points_min[j, 1] = np.min(new_points[:, 1])
+            new_points_max[j, 0] = np.max(new_points[:, 0])
+            new_points_max[j, 1] = np.max(new_points[:, 1])
+    # 初始化目标点的数量和位置
+    n = 0  # 目标点数量初始化
+    target_points = np.zeros((k_obj, 2))  # 目标点坐标初始化
+
+    for j in range(k_obj):
+        # 如果对象满足小矩形的大小约束，则认为它是一个目标点
+        if (new_points_max[j, 0] - new_points_min[j, 0] <= small_rect * 3 and
+                new_points_max[j, 1] - new_points_min[j, 1] <= small_rect * 3):
+            n += 1
+            target_points[n - 1, :] = new_points[j, :]  # 保存目标点位置
+
+        # 如果遍历完所有对象没有目标点，则选择最后一个聚类作为目标
+        if j == k_obj - 1 and n == 0:
+            n = k_obj  # 目标点数量设为总对象数
+            target_points[n - 1, :] = new_points[n - 1, :]  # 保存最后一个聚类作为目标
+    single_time_read = time.time() - single_time
+    print(f'单帧经过的时间: {single_time_read:.4f} 秒')
+
+    # 绘制最终确认的目标点
+    # plt.figure()  # 创建新图形窗口
+    # plt.imshow(I, cmap='gray')  # 显示图像
+    # plt.axis('off')  # 关闭坐标轴
+
+    # for check in range(n):
+    #     # 绘制每个目标点的矩形边界
+    #     rect = plt.Rectangle((target_points[check, 1] - small_rect,
+    #                           target_points[check, 0] - small_rect),
+    #                          2 * small_rect, 2 * small_rect,
+    #                          edgecolor='r', linewidth=2, fill=False)
+    #     plt.gca().add_patch(rect)  # 将矩形添加到当前图形
+    #
+    # plt.show()  # 显示图形
+    # elapsed_time = time.time() - current_frame_start_time  # 计算处理时间
+    # print(f'总处理经过的时间: {elapsed_time:.4f} 秒')
+
